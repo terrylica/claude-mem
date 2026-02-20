@@ -9,9 +9,12 @@
  * - Parse XML responses (same format as Claude/Gemini)
  * - Sync to database and Chroma
  * - Support dynamic model selection across providers
+ *
+ * FILE-SIZE-OK — monolithic agent class, compaction method added 2026-02-19
  */
 
-import { buildContinuationPrompt, buildInitPrompt, buildObservationPrompt, buildSummaryPrompt } from '../../sdk/prompts.js';
+// GitHub Issue: https://github.com/terrylica/claude-mem/issues/1
+import { buildContinuationPrompt, buildInitPrompt, buildObservationPrompt, buildSummaryPrompt, buildSummaryContextPrompt } from '../../sdk/prompts.js';
 import { getCredential } from '../../shared/EnvManager.js';
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
 import { USER_SETTINGS_PATH } from '../../shared/paths.js';
@@ -35,6 +38,10 @@ const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const DEFAULT_MAX_CONTEXT_MESSAGES = 20;  // Maximum messages to keep in conversation history
 const DEFAULT_MAX_ESTIMATED_TOKENS = 100000;  // ~100k tokens max context (safety limit)
 const CHARS_PER_TOKEN_ESTIMATE = 4;  // Conservative estimate: 1 token = 4 chars
+
+// History compaction constants (cherry-picked from doublefx/magic-claude-mem 797a2703)
+const COMPACT_THRESHOLD = 14;  // Compact when history exceeds 14 messages (7 turns)
+const KEEP_RECENT = 6;         // Keep last 6 messages (3 recent turns) after compaction
 
 // OpenAI-compatible message format
 interface OpenAIMessage {
@@ -110,6 +117,7 @@ export class OpenRouterAgent {
 
       // Add to conversation history and query OpenRouter with full context
       session.conversationHistory.push({ role: 'user', content: initPrompt });
+      this.compactHistory(session);
       const initResponse = await this.queryOpenRouterMultiTurn(session.conversationHistory, apiKey, model, siteUrl, appName);
 
       if (initResponse.content) {
@@ -180,6 +188,7 @@ export class OpenRouterAgent {
 
           // Add to conversation history and query OpenRouter with full context
           session.conversationHistory.push({ role: 'user', content: obsPrompt });
+          this.compactHistory(session);
           const obsResponse = await this.queryOpenRouterMultiTurn(session.conversationHistory, apiKey, model, siteUrl, appName);
 
           let tokensUsed = 0;
@@ -222,6 +231,7 @@ export class OpenRouterAgent {
 
           // Add to conversation history and query OpenRouter with full context
           session.conversationHistory.push({ role: 'user', content: summaryPrompt });
+          this.compactHistory(session);
           const summaryResponse = await this.queryOpenRouterMultiTurn(session.conversationHistory, apiKey, model, siteUrl, appName);
 
           let tokensUsed = 0;
@@ -287,6 +297,52 @@ export class OpenRouterAgent {
    */
   private estimateTokens(text: string): number {
     return Math.ceil(text.length / CHARS_PER_TOKEN_ESTIMATE);
+  }
+
+  /**
+   * Compact conversation history to preserve instructions and session context.
+   * Replaces blind truncation by keeping: [initPrompt, summaryContext, ...recentMessages]
+   * Only triggers when history exceeds COMPACT_THRESHOLD.
+   * Source: doublefx/magic-claude-mem commit 797a2703
+   */
+  private compactHistory(session: ActiveSession): void {
+    const history = session.conversationHistory;
+    if (history.length <= COMPACT_THRESHOLD) {
+      return;
+    }
+
+    const originalLength = history.length;
+
+    let summaryContext: string;
+    try {
+      const summary = session.memorySessionId
+        ? this.dbManager.getSessionStore().getSummaryForSession(session.memorySessionId)
+        : null;
+      summaryContext = buildSummaryContextPrompt(summary);
+    } catch (error) {
+      logger.warn('SDK', 'Failed to read summary for compaction, using empty context', {
+        sessionId: session.sessionDbId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      summaryContext = buildSummaryContextPrompt(null);
+    }
+
+    // Rebuild: [initPrompt, summaryContext, ...recentMessages]
+    const initPrompt = history[0];
+    const recentMessages = history.slice(-KEEP_RECENT);
+
+    session.conversationHistory = [
+      initPrompt,
+      { role: 'user', content: summaryContext },
+      ...recentMessages
+    ];
+
+    logger.info('SDK', 'Compacted OpenRouter history', {
+      sessionId: session.sessionDbId,
+      before: originalLength,
+      after: session.conversationHistory.length,
+      keptRecent: KEEP_RECENT
+    });
   }
 
   /**
